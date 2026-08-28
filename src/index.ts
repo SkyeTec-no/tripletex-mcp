@@ -50,16 +50,27 @@ function readOnly(): boolean {
   return process.env.MCP_READ_ONLY === "true";
 }
 
-/** A view of the server that drops write tools when MCP_READ_ONLY is on. */
+/**
+ * A view of the server that drops write tools when MCP_READ_ONLY is on — and
+ * stamps the surviving reads with readOnlyHint, so clients that trust the
+ * server's own annotations (the SkyeTec tenant's baseline tests do) see the
+ * guarantee the mode enforces.
+ */
 function toolSink(server: McpServer): McpServer {
   if (!readOnly()) return server;
   return new Proxy(server, {
     get(target, prop, receiver) {
       if (prop === "tool") {
-        return (name: string, ...rest: unknown[]) =>
-          READ_TOOLS.has(name)
-            ? (target.tool as (...a: unknown[]) => unknown)(name, ...rest)
-            : undefined;
+        return (name: string, ...rest: unknown[]) => {
+          if (!READ_TOOLS.has(name)) return undefined;
+          const cb = rest.pop();
+          return (target.tool as (...a: unknown[]) => unknown)(
+            name,
+            ...rest,
+            { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
+            cb
+          );
+        };
       }
       return Reflect.get(target, prop, receiver);
     },
