@@ -161,7 +161,7 @@ function authorizePage(params: URLSearchParams, error?: string): string {
   <p>SkyeTec-rådgiveren ber om lesetilgang til Tripletex-miljøet <strong>${env}</strong> — med
   <em>din</em> Tripletex-bruker, slik at den bare ser det du selv har lov til å se.</p>
   <ol>
-    <li>Logg inn i Tripletex og gå til <strong>Selskap → API-tokens</strong>.</li>
+    <li>Logg inn i Tripletex og åpne ditt eget ansattkort — fanen <strong>API-tilganger</strong> (eldre versjoner: Selskap → API-tokens).</li>
     <li>Opprett et personlig token og kopier verdien (begynner med <code>tlxr_</code>).</li>
     <li>Lim det inn her. Tokenet lagres aldri i klartekst — det forsegles kryptert inne i
         tilgangsnøkkelen denne påloggingen utsteder.</li>
