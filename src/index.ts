@@ -8,6 +8,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { AsyncLocalStorage } from "node:async_hooks";
 import {
   TripletexApiError,
   TripletexClient,
@@ -51,6 +52,78 @@ function readOnly(): boolean {
 }
 
 /**
+ * Idempotency for the gated writes (SkyeTec fork). The consuming tenant's
+ * committer sends `Idempotency-Key: <write_id>` on every HTTP request of its
+ * one-shot MCP client; a retried approval reuses the same key. The key rides
+ * AsyncLocalStorage from the HTTP handler into the tool callback (the callback
+ * closes over the session, not the request), and a keyed write returns the
+ * cached FIRST result instead of running again — an invoice is money, and a
+ * committer retry must never create it twice. In-memory only (min_replicas=1;
+ * a restart loses the cache, but the tenant outbox's status short-circuit is
+ * the first ring of dedupe — this is the belt to that braces).
+ */
+const idemContext = new AsyncLocalStorage<{ key: string | undefined }>();
+const IDEM_TTL_MS = 48 * 60 * 60 * 1000;
+const idemCache = new Map<string, { at: number; result: unknown }>();
+
+function isErrorShapedResult(result: unknown): boolean {
+  const text = (result as { content?: Array<{ text?: string }> } | null)?.content?.[0]?.text;
+  if (!text) return false;
+  try {
+    const parsed = JSON.parse(text) as { httpStatus?: number };
+    return typeof parsed.httpStatus === "number" && parsed.httpStatus >= 400;
+  } catch {
+    return false;
+  }
+}
+
+function idempotencyKeyFromRequest(req: IncomingMessage): string | undefined {
+  const raw = req.headers["idempotency-key"];
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  return value && value.trim() ? value.trim() : undefined;
+}
+
+function withIdempotency(
+  toolName: string,
+  cb: (...a: unknown[]) => unknown
+): (...a: unknown[]) => Promise<unknown> {
+  return async (...a: unknown[]) => {
+    const key = idemContext.getStore()?.key;
+    if (!key) return cb(...a);
+    const cacheKey = `${toolName}:${key}`;
+    const now = Date.now();
+    for (const [k, v] of idemCache) if (now - v.at > IDEM_TTL_MS) idemCache.delete(k);
+    const hit = idemCache.get(cacheKey);
+    if (hit) return hit.result;
+    const result = await cb(...a);
+    // Cache only success — a failed attempt must stay retryable. Upstream's run()
+    // returns Tripletex API errors as SUCCESS text ({"httpStatus": 4xx, ...}), so
+    // error-shaped text must be recognised here or a failed invoice would be
+    // "deduped" into permanent failure.
+    if (!(result as { isError?: boolean } | null)?.isError && !isErrorShapedResult(result)) {
+      idemCache.set(cacheKey, { at: now, result });
+    }
+    return result;
+  };
+}
+
+/**
+ * Writes explicitly opened through the read-only gate (SkyeTec fork):
+ * MCP_WRITE_TOOLS is a comma-separated allowlist of write-tool names to register
+ * IN ADDITION to the read surface. Empty/unset → pure read-only. The consuming
+ * tenant gates every one of these behind its human-approval pipe; this knob only
+ * decides what exists to be gated.
+ */
+function allowedWriteTools(): Set<string> {
+  return new Set(
+    (process.env.MCP_WRITE_TOOLS ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+  );
+}
+
+/**
  * A view of the server that drops write tools when MCP_READ_ONLY is on — and
  * stamps the surviving reads with readOnlyHint, so clients that trust the
  * server's own annotations (the SkyeTec tenant's baseline tests do) see the
@@ -58,17 +131,21 @@ function readOnly(): boolean {
  */
 function toolSink(server: McpServer): McpServer {
   if (!readOnly()) return server;
+  const writes = allowedWriteTools();
   return new Proxy(server, {
     get(target, prop, receiver) {
       if (prop === "tool") {
         return (name: string, ...rest: unknown[]) => {
-          if (!READ_TOOLS.has(name)) return undefined;
-          const cb = rest.pop();
+          const isRead = READ_TOOLS.has(name);
+          if (!isRead && !writes.has(name)) return undefined;
+          const cb = rest.pop() as (...a: unknown[]) => unknown;
           return (target.tool as (...a: unknown[]) => unknown)(
             name,
             ...rest,
-            { readOnlyHint: true, destructiveHint: false, openWorldHint: true },
-            cb
+            isRead
+              ? { readOnlyHint: true, destructiveHint: false, openWorldHint: true }
+              : { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+            isRead ? cb : withIdempotency(name, cb)
           );
         };
       }
@@ -1031,7 +1108,7 @@ async function main() {
           if (sessionId && transports.has(sessionId)) {
             // Existing session — forward to its transport
             const transport = transports.get(sessionId)!;
-            await transport.handleRequest(req, res);
+            await idemContext.run({ key: idempotencyKeyFromRequest(req) }, () => transport.handleRequest(req, res));
             return;
           }
 
@@ -1068,7 +1145,7 @@ async function main() {
           if (!readOnly()) registerSkills(sessionServer);
 
           await sessionServer.connect(transport);
-          await transport.handleRequest(req, res);
+          await idemContext.run({ key: idempotencyKeyFromRequest(req) }, () => transport.handleRequest(req, res));
           return;
         }
 
@@ -1077,7 +1154,7 @@ async function main() {
           const sessionId = req.headers["mcp-session-id"] as string | undefined;
           if (sessionId && transports.has(sessionId)) {
             const transport = transports.get(sessionId)!;
-            await transport.handleRequest(req, res);
+            await idemContext.run({ key: idempotencyKeyFromRequest(req) }, () => transport.handleRequest(req, res));
             return;
           }
           res.writeHead(400, { "Content-Type": "application/json" });
@@ -1090,7 +1167,7 @@ async function main() {
           const sessionId = req.headers["mcp-session-id"] as string | undefined;
           if (sessionId && transports.has(sessionId)) {
             const transport = transports.get(sessionId)!;
-            await transport.handleRequest(req, res);
+            await idemContext.run({ key: idempotencyKeyFromRequest(req) }, () => transport.handleRequest(req, res));
             transports.delete(sessionId);
             return;
           }
