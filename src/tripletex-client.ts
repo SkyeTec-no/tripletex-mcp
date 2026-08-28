@@ -12,8 +12,9 @@ interface SessionToken {
   expiresAtMs: number;
 }
 
-/** Session lifetime for the JWT flow. Tripletex lets us pick; 12h is plenty. */
-const DEFAULT_TTL_SECONDS = 12 * 60 * 60;
+/** Session lifetime for the JWT flow. Tripletex rejects anything over 28800
+ * ("Kan ikke være over 28800"), so 8h is the ceiling, not a choice. */
+const DEFAULT_TTL_SECONDS = 8 * 60 * 60;
 /** Renew a little early so a long request never runs past the expiry. */
 const RENEW_MARGIN_MS = 60 * 1000;
 

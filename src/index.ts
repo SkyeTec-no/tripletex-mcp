@@ -19,6 +19,52 @@ import {
   type OrderLineInput,
 } from "./tripletex-transform.js";
 import { registerSkills } from "./skills/registry.js";
+import { handleOAuth, send401, tripletexTokenFromBearer } from "./oauth.js";
+
+/**
+ * The read-only surface (SkyeTec fork): with MCP_READ_ONLY=true only these
+ * tools register and the workflow skills stay off — writes to Tripletex belong
+ * to the orchestrator, never to this connector (tenant ADR-0022).
+ */
+const READ_TOOLS = new Set([
+  "get_invoice",
+  "search_invoices",
+  "search_supplier_invoices",
+  "search_orders",
+  "search_customers",
+  "search_products",
+  "search_suppliers",
+  "search_accounts",
+  "search_vat_types",
+  "search_vouchers",
+  "get_voucher",
+  "get_balance_sheet",
+  "search_projects",
+  "search_activities",
+  "search_time_entries",
+  "search_employees",
+  "whoami",
+]);
+
+function readOnly(): boolean {
+  return process.env.MCP_READ_ONLY === "true";
+}
+
+/** A view of the server that drops write tools when MCP_READ_ONLY is on. */
+function toolSink(server: McpServer): McpServer {
+  if (!readOnly()) return server;
+  return new Proxy(server, {
+    get(target, prop, receiver) {
+      if (prop === "tool") {
+        return (name: string, ...rest: unknown[]) =>
+          READ_TOOLS.has(name)
+            ? (target.tool as (...a: unknown[]) => unknown)(name, ...rest)
+            : undefined;
+      }
+      return Reflect.get(target, prop, receiver);
+    },
+  });
+}
 
 /**
  * Client whose construction is deferred to the first tool call, so the HTTP
@@ -30,7 +76,12 @@ function lazyClient(credentials?: TripletexCredentials): TripletexClient {
   return new Proxy({} as TripletexClient, {
     get(_target, prop) {
       if (!real) real = new TripletexClient(credentials);
-      return (real as any)[prop];
+      const value = (real as any)[prop];
+      // Bind methods to the REAL instance: called through the proxy, `this`
+      // would otherwise be the proxy, whose default `set` writes onto the empty
+      // target — `this.session = …` then never lands on the client and every
+      // call dies on a null session.
+      return typeof value === "function" ? value.bind(real) : value;
     },
   });
 }
@@ -946,8 +997,22 @@ async function main() {
         }
       }
 
+      // OAuth authorization-server endpoints (SkyeTec fork) — discovery, DCR,
+      // the paste-token authorize page, and token minting. No-ops unless
+      // OAUTH_ENC_KEY is configured.
+      if (await handleOAuth(req, res, url)) return;
+
       // MCP endpoint
       if (url.pathname === "/mcp") {
+        // With OAuth enabled the Bearer token is the ONLY accepted credential —
+        // the legacy X-Tripletex-* headers would bypass the allowlist and the
+        // token sealing, so they are ignored entirely in that mode.
+        const bearer = tripletexTokenFromBearer(req);
+        if (bearer === null) {
+          send401(res);
+          return;
+        }
+
         // Handle new session initialization (POST without session ID)
         if (req.method === "POST") {
           const sessionId = req.headers["mcp-session-id"] as string | undefined;
@@ -984,8 +1049,12 @@ async function main() {
 
           // Re-register all tools on the session server, bound to whatever
           // credentials this client sent (falling back to the environment).
-          registerAllTools(sessionServer, lazyClient(credentialsFromHeaders(req)));
-          registerSkills(sessionServer);
+          const credentials =
+            bearer === "off"
+              ? credentialsFromHeaders(req)
+              : { jwt: bearer, env: process.env.TRIPLETEX_ENV };
+          registerAllTools(toolSink(sessionServer), lazyClient(credentials));
+          if (!readOnly()) registerSkills(sessionServer);
 
           await sessionServer.connect(transport);
           await transport.handleRequest(req, res);
@@ -1034,8 +1103,8 @@ async function main() {
     });
   } else {
     // --- stdio transport (default, for local usage) ---
-    registerAllTools(server, lazyClient());
-    registerSkills(server);
+    registerAllTools(toolSink(server), lazyClient());
+    if (!readOnly()) registerSkills(server);
     const transport = new StdioServerTransport();
     await server.connect(transport);
     console.error("Tripletex MCP server running on stdio");
