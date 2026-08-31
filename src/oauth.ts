@@ -59,6 +59,27 @@ function publicBaseUrl(): string {
   return url.replace(/\/$/, "");
 }
 
+// The RESOURCE base may differ from the AS base: behind the mcp.skyetec.ai
+// path router this server is mounted at /<connector> while the OAuth AS stays
+// at the origin root (the substrate's silent refresh is origin-root-only, so
+// the issuer cannot move under the path). Unset → same as PUBLIC_BASE_URL,
+// which is the standalone-hostname deployment.
+function publicResourceUrl(): string {
+  const url = process.env.PUBLIC_RESOURCE_URL;
+  return url ? url.replace(/\/$/, "") : publicBaseUrl();
+}
+
+// RFC 9728 canonical form: well-known at the origin root with the resource
+// path appended. Standalone (resource == base) keeps the historic un-suffixed
+// URL so existing clients see no change.
+function resourceMetadataUrl(): string {
+  const base = publicBaseUrl();
+  const resource = publicResourceUrl();
+  if (resource === base) return `${base}/.well-known/oauth-protected-resource`;
+  const path = resource.startsWith(base) ? resource.slice(base.length) : "";
+  return `${base}/.well-known/oauth-protected-resource${path}/mcp`;
+}
+
 // --- sealing ----------------------------------------------------------------
 
 function seal(payload: object): string {
@@ -167,7 +188,7 @@ function authorizePage(params: URLSearchParams, error?: string): string {
         tilgangsnøkkelen denne påloggingen utsteder.</li>
   </ol>
   ${error ? `<p class="err">${esc(error)}</p>` : ""}
-  <form method="post" action="/authorize">
+  <form method="post" action="${publicBaseUrl()}/authorize">
       ${hidden}
       <label for="token">Personlig API-token</label>
       <input type="password" id="token" name="token" autocomplete="off" required>
@@ -181,7 +202,7 @@ function authorizePage(params: URLSearchParams, error?: string): string {
 function metadata(): object {
   const base = publicBaseUrl();
   return {
-    issuer: `${base}/`,
+    issuer: base,
     authorization_endpoint: `${base}/authorize`,
     token_endpoint: `${base}/token`,
     registration_endpoint: `${base}/register`,
@@ -322,7 +343,7 @@ export function tripletexTokenFromBearer(req: IncomingMessage): string | null | 
 export function send401(res: ServerResponse): void {
   res.writeHead(401, {
     "Content-Type": "application/json",
-    "WWW-Authenticate": `Bearer resource_metadata="${publicBaseUrl()}/.well-known/oauth-protected-resource"`,
+    "WWW-Authenticate": `Bearer resource_metadata="${resourceMetadataUrl()}"`,
   });
   res.end(JSON.stringify({ error: "invalid_token" }));
 }
@@ -336,14 +357,14 @@ export async function handleOAuth(
   if (!oauthEnabled()) return false;
   const { pathname } = url;
 
-  if (pathname === "/.well-known/oauth-authorization-server" && req.method === "GET") {
+  if ((pathname === "/.well-known/oauth-authorization-server" || pathname.startsWith("/.well-known/oauth-authorization-server/")) && req.method === "GET") {
     sendJson(res, 200, metadata());
     return true;
   }
-  if (pathname === "/.well-known/oauth-protected-resource" && req.method === "GET") {
+  if ((pathname === "/.well-known/oauth-protected-resource" || pathname.startsWith("/.well-known/oauth-protected-resource/")) && req.method === "GET") {
     sendJson(res, 200, {
-      resource: `${publicBaseUrl()}/mcp`,
-      authorization_servers: [`${publicBaseUrl()}/`],
+      resource: `${publicResourceUrl()}/mcp`,
+      authorization_servers: [publicBaseUrl()],
     });
     return true;
   }
