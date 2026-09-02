@@ -174,6 +174,9 @@ function tomorrow(): string {
  * endpoint matching its kind. Returns null when the token works, otherwise the
  * message to show on the authorize page.
  */
+const UPSTREAM_DOWN =
+  "Tripletex svarer ikke akkurat nå. Dette er ikke feil med nøkkelen din — prøv igjen om litt.";
+
 async function validateTripletexToken(
   token: string,
   env: string,
@@ -194,6 +197,10 @@ async function validateTripletexToken(
       `&employeeToken=${encodeURIComponent(token)}&expirationDate=${tomorrow()}`;
     const res = await fetch(url, { method: "PUT" });
     if (res.ok) return null;
+    // A 5xx is Tripletex being unwell, not a bad paste. Saying "we rejected your
+    // key" to someone holding a perfectly good one sends them off re-copying it
+    // for nothing — observed against api-test, which 502s intermittently.
+    if (res.status >= 500) return UPSTREAM_DOWN;
     const app = consumerName();
     return (
       "Tripletex avviste nøkkelen. Sjekk at hele verdien er kopiert, at den er opprettet " +
@@ -210,6 +217,7 @@ async function validateTripletexToken(
     body: JSON.stringify({ refreshToken: token, ttlSeconds: 300 }),
   });
   if (res.ok) return null;
+  if (res.status >= 500) return UPSTREAM_DOWN;
   return (
     "Tripletex avviste tokenet. En personlig nøkkel fra ansattkortet → API-tilganger " +
     "begynner med «eyJ» — sjekk at hele verdien er med. Et tlxr_-token hentes fra " +
