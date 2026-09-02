@@ -174,6 +174,27 @@ function tomorrow(): string {
  * endpoint matching its kind. Returns null when the token works, otherwise the
  * message to show on the authorize page.
  */
+const SERVER_MISCONFIGURED =
+  "Serveren mangler en gyldig consumer token. Dette er en feil hos SkyeTec, ikke med nøkkelen din — kontakt oss.";
+
+/**
+ * Did Tripletex reject OUR consumer token rather than the user's key? It answers
+ * 422 with the offending field named ("consumerToken" / "arg:consumerToken"),
+ * which is the difference between "we are misconfigured" and "check your paste".
+ * Covers the unset case AND the placeholder one — a seeded-but-wrong value is
+ * truthy, so an emptiness check alone would blame the user.
+ */
+function consumerTokenRejected(body: string): boolean {
+  try {
+    const d = JSON.parse(body) as { validationMessages?: Array<{ field?: unknown }> };
+    return (d.validationMessages ?? []).some(
+      (m) => typeof m.field === "string" && m.field.toLowerCase().includes("consumertoken")
+    );
+  } catch {
+    return false;
+  }
+}
+
 const UPSTREAM_DOWN =
   "Tripletex svarer ikke akkurat nå. Dette er ikke feil med nøkkelen din — prøv igjen om litt.";
 
@@ -189,9 +210,7 @@ async function validateTripletexToken(
     // No consumer token is a server misconfiguration, not a bad paste. Tripletex
     // answers 422 "Nøkkelen er ugyldig" on the consumerToken field, which would
     // otherwise be reported to the user as *their* key being wrong.
-    if (!consumer) {
-      return "Serveren mangler consumer token. Dette er en feil hos SkyeTec, ikke med nøkkelen din — kontakt oss.";
-    }
+    if (!consumer) return SERVER_MISCONFIGURED;
     const url =
       `${base}/token/session/:create?consumerToken=${encodeURIComponent(consumer)}` +
       `&employeeToken=${encodeURIComponent(token)}&expirationDate=${tomorrow()}`;
@@ -201,6 +220,7 @@ async function validateTripletexToken(
     // key" to someone holding a perfectly good one sends them off re-copying it
     // for nothing — observed against api-test, which 502s intermittently.
     if (res.status >= 500) return UPSTREAM_DOWN;
+    if (consumerTokenRejected(await res.text())) return SERVER_MISCONFIGURED;
     const app = consumerName();
     return (
       "Tripletex avviste nøkkelen. Sjekk at hele verdien er kopiert, at den er opprettet " +
