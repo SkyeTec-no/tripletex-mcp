@@ -31,10 +31,13 @@
 import { createHash, createCipheriv, createDecipheriv, randomBytes, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
-const PROD_SESSION_URL =
-  "https://tripletex.no/v2/token/session/:createFromRefreshToken";
-const TEST_SESSION_URL =
-  "https://api-test.tripletex.tech/v2/token/session/:createFromRefreshToken";
+const PROD_BASE = "https://tripletex.no/v2";
+const TEST_BASE = "https://api-test.tripletex.tech/v2";
+
+const apiBase = (env: string) => (env === "test" ? TEST_BASE : PROD_BASE);
+
+/** The application name users must type when creating their key in Tripletex. */
+const consumerName = () => process.env.TRIPLETEX_CONSUMER_NAME ?? "";
 
 const CODE_TTL_MS = 5 * 60 * 1000;
 const ACCESS_TTL_MS = 24 * 60 * 60 * 1000;
@@ -130,16 +133,88 @@ function redirectAllowed(uri: string): boolean {
 
 // --- Tripletex validation ---------------------------------------------------
 
-/** Validate a pasted personal token by creating a real (short) Tripletex session. */
-async function validateTripletexToken(tlxr: string, env: string): Promise<boolean> {
-  const url = env === "test" ? TEST_SESSION_URL : PROD_SESSION_URL;
-  const res = await fetch(url, {
+export type TokenKind = "jwt" | "employee";
+
+/**
+ * Which Tripletex credential did the user paste?
+ *
+ *   - "employee" — the personal key from ansattkortet -> API-tilganger, which
+ *     Tripletex hands out as base64 of {"tokenId":<int>,"token":"<uuid>"}. It is
+ *     redeemed together with OUR consumer token at PUT /token/session/:create.
+ *   - "jwt" — the tlxr_ refresh secret from Selskap -> API-tokens, redeemed on
+ *     its own at POST /token/session/:createFromRefreshToken.
+ *
+ * Only the employee shape is detected positively; everything else keeps taking
+ * the historic refresh-token path, so setups that worked before are unaffected
+ * and Tripletex stays the judge of what is actually valid.
+ */
+export function tokenKind(value: string): TokenKind {
+  try {
+    const parsed = JSON.parse(Buffer.from(value, "base64").toString()) as {
+      tokenId?: unknown;
+      token?: unknown;
+    };
+    if (typeof parsed?.tokenId === "number" && typeof parsed?.token === "string") {
+      return "employee";
+    }
+  } catch {
+    /* not base64 JSON — fall through to the refresh-token path */
+  }
+  return "jwt";
+}
+
+function tomorrow(): string {
+  const d = new Date();
+  d.setDate(d.getDate() + 1);
+  return d.toISOString().split("T")[0];
+}
+
+/**
+ * Validate a pasted token by creating a real (short) Tripletex session on the
+ * endpoint matching its kind. Returns null when the token works, otherwise the
+ * message to show on the authorize page.
+ */
+async function validateTripletexToken(
+  token: string,
+  env: string,
+  kind: TokenKind
+): Promise<string | null> {
+  const base = apiBase(env);
+
+  if (kind === "employee") {
+    const consumer = process.env.TRIPLETEX_CONSUMER_TOKEN ?? "";
+    // No consumer token is a server misconfiguration, not a bad paste. Tripletex
+    // answers 422 "Nøkkelen er ugyldig" on the consumerToken field, which would
+    // otherwise be reported to the user as *their* key being wrong.
+    if (!consumer) {
+      return "Serveren mangler consumer token. Dette er en feil hos SkyeTec, ikke med nøkkelen din — kontakt oss.";
+    }
+    const url =
+      `${base}/token/session/:create?consumerToken=${encodeURIComponent(consumer)}` +
+      `&employeeToken=${encodeURIComponent(token)}&expirationDate=${tomorrow()}`;
+    const res = await fetch(url, { method: "PUT" });
+    if (res.ok) return null;
+    const app = consumerName();
+    return (
+      "Tripletex avviste nøkkelen. Sjekk at hele verdien er kopiert, at den er opprettet " +
+      "under ditt eget ansattkort → API-tilganger" +
+      (app ? `, og at applikasjonsnavnet er «${app}»` : "") +
+      "."
+    );
+  }
+
+  const res = await fetch(`${base}/token/session/:createFromRefreshToken`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     // Tripletex enforces a 300s minimum session ttl (422 "Må være minimum 300").
-    body: JSON.stringify({ refreshToken: tlxr, ttlSeconds: 300 }),
+    body: JSON.stringify({ refreshToken: token, ttlSeconds: 300 }),
   });
-  return res.ok;
+  if (res.ok) return null;
+  return (
+    "Tripletex avviste tokenet. En personlig nøkkel fra ansattkortet → API-tilganger " +
+    "begynner med «eyJ» — sjekk at hele verdien er med. Et tlxr_-token hentes fra " +
+    "Selskap → API-tokens."
+  );
 }
 
 // --- HTTP plumbing ----------------------------------------------------------
@@ -168,6 +243,7 @@ function authorizePage(params: URLSearchParams, error?: string): string {
     .map((k) => `<input type="hidden" name="${k}" value="${esc(params.get(k) ?? "")}">`)
     .join("\n      ");
   const env = process.env.TRIPLETEX_ENV === "test" ? "test (api-test.tripletex.tech)" : "produksjon (tripletex.no)";
+  const app = consumerName();
   return `<!doctype html>
 <html lang="no"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Koble til Tripletex</title>
@@ -182,11 +258,14 @@ function authorizePage(params: URLSearchParams, error?: string): string {
   <p>SkyeTec-rådgiveren ber om lesetilgang til Tripletex-miljøet <strong>${env}</strong> — med
   <em>din</em> Tripletex-bruker, slik at den bare ser det du selv har lov til å se.</p>
   <ol>
-    <li>Logg inn i Tripletex og åpne ditt eget ansattkort — fanen <strong>API-tilganger</strong> (eldre versjoner: Selskap → API-tokens).</li>
-    <li>Opprett et personlig token og kopier verdien (begynner med <code>tlxr_</code>).</li>
-    <li>Lim det inn her. Tokenet lagres aldri i klartekst — det forsegles kryptert inne i
+    <li>Logg inn i Tripletex og åpne ditt eget ansattkort — fanen <strong>API-tilganger</strong>.</li>
+    <li>Opprett en ny nøkkel${app ? ` og oppgi applikasjonsnavnet <code>${esc(app)}</code>` : ""}.
+        Kopier verdien (begynner med <code>eyJ</code>).</li>
+    <li>Lim den inn her. Nøkkelen lagres aldri i klartekst — den forsegles kryptert inne i
         tilgangsnøkkelen denne påloggingen utsteder.</li>
   </ol>
+  <p style="color:#555;font-size:.9rem">Har du i stedet et <code>tlxr_</code>-token fra
+     Selskap → API-tokens, virker det også.</p>
   ${error ? `<p class="err">${esc(error)}</p>` : ""}
   <form method="post" action="${publicBaseUrl()}/authorize">
       ${hidden}
@@ -268,11 +347,17 @@ async function handleAuthorizeSubmit(res: ServerResponse, body: string): Promise
   }
   const token = (form.get("token") ?? "").trim();
   const env = process.env.TRIPLETEX_ENV === "test" ? "test" : "prod";
-  if (!token || !(await validateTripletexToken(token, env))) {
-    sendHtml(res, 400, authorizePage(form, "Tripletex avviste tokenet — sjekk at det er kopiert i sin helhet, og at det hører til riktig miljø."));
+  if (!token) {
+    sendHtml(res, 400, authorizePage(form, "Fyll inn nøkkelen."));
     return;
   }
-  const code = seal({ k: "code", t: token, c: form.get("code_challenge"), r: form.get("redirect_uri"), e: Date.now() + CODE_TTL_MS });
+  const kind = tokenKind(token);
+  const rejected = await validateTripletexToken(token, env, kind);
+  if (rejected) {
+    sendHtml(res, 400, authorizePage(form, rejected));
+    return;
+  }
+  const code = seal({ k: "code", t: token, kind, c: form.get("code_challenge"), r: form.get("redirect_uri"), e: Date.now() + CODE_TTL_MS });
   const target = new URL(form.get("redirect_uri")!);
   target.searchParams.set("code", code);
   const state = form.get("state");
@@ -281,13 +366,22 @@ async function handleAuthorizeSubmit(res: ServerResponse, body: string): Promise
   res.end();
 }
 
-function mintTokens(tlxr: string): object {
+function mintTokens(secret: string, kind: TokenKind): object {
   return {
-    access_token: seal({ k: "access", t: tlxr, e: Date.now() + ACCESS_TTL_MS }),
+    access_token: seal({ k: "access", t: secret, kind, e: Date.now() + ACCESS_TTL_MS }),
     token_type: "Bearer",
     expires_in: Math.floor(ACCESS_TTL_MS / 1000),
-    refresh_token: seal({ k: "refresh", t: tlxr, e: Date.now() + REFRESH_TTL_MS }),
+    refresh_token: seal({ k: "refresh", t: secret, kind, e: Date.now() + REFRESH_TTL_MS }),
   };
+}
+
+/**
+ * Tokens minted before employee-token support carry no `kind`. They are all
+ * refresh-token secrets, so defaulting to "jwt" keeps every already-connected
+ * client working across the deploy instead of silently logging it out.
+ */
+function sealedKind(v: unknown): TokenKind {
+  return v === "employee" ? "employee" : "jwt";
 }
 
 function handleToken(res: ServerResponse, body: string): void {
@@ -310,7 +404,7 @@ function handleToken(res: ServerResponse, body: string): void {
       sendJson(res, 400, { error: "invalid_grant", error_description: "PKCE verification failed" });
       return;
     }
-    sendJson(res, 200, mintTokens(code.t));
+    sendJson(res, 200, mintTokens(code.t, sealedKind(code.kind)));
     return;
   }
   if (grant === "refresh_token") {
@@ -319,25 +413,41 @@ function handleToken(res: ServerResponse, body: string): void {
       sendJson(res, 400, { error: "invalid_grant", error_description: "refresh token invalid or expired" });
       return;
     }
-    sendJson(res, 200, mintTokens(rt.t));
+    sendJson(res, 200, mintTokens(rt.t, sealedKind(rt.kind)));
     return;
   }
   sendJson(res, 400, { error: "unsupported_grant_type" });
 }
 
+export interface BearerAuth {
+  /** The Tripletex secret sealed at /authorize. */
+  token: string;
+  /** Which Tripletex session flow redeems it. */
+  kind: TokenKind;
+  /**
+   * Stable, non-reversible per-caller id. Used to scope server-side caches so
+   * two users cannot collide on a shared cache key; safe to log.
+   */
+  scope: string;
+}
+
 /**
- * The Bearer gate for /mcp. Returns the sealed Tripletex token when the header
- * is valid, null when it is missing/invalid (caller answers 401), and "off"
- * when OAuth is not configured (caller falls back to legacy header auth).
+ * The Bearer gate for /mcp. Returns the sealed Tripletex credential when the
+ * header is valid, null when it is missing/invalid (caller answers 401), and
+ * "off" when OAuth is not configured (caller falls back to legacy header auth).
  */
-export function tripletexTokenFromBearer(req: IncomingMessage): string | null | "off" {
+export function tripletexTokenFromBearer(req: IncomingMessage): BearerAuth | null | "off" {
   if (!oauthEnabled()) return "off";
   const header = req.headers.authorization ?? "";
   const match = /^Bearer (.+)$/.exec(Array.isArray(header) ? header[0] : header);
   if (!match) return null;
   const tok = unseal(match[1]);
   if (!tok || tok.k !== "access" || typeof tok.t !== "string" || (tok.e as number) < Date.now()) return null;
-  return tok.t;
+  return {
+    token: tok.t,
+    kind: sealedKind(tok.kind),
+    scope: createHash("sha256").update(tok.t).digest("base64url").slice(0, 16),
+  };
 }
 
 export function send401(res: ServerResponse): void {

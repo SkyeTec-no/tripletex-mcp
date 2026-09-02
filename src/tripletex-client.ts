@@ -38,6 +38,14 @@ export interface TripletexCredentials {
   jwt?: string;
   consumerToken?: string;
   employeeToken?: string;
+  /**
+   * Pin the session flow instead of inferring it from which fields are set, and
+   * suppress the environment fallback for the credential the other flow uses.
+   * The OAuth path must set this: with TRIPLETEX_JWT configured for a
+   * single-tenant deployment, an employee-token session would otherwise fall
+   * back to the environment JWT and silently run as the wrong user.
+   */
+  kind?: "jwt" | "employee";
   /** "test" targets api-test.tripletex.tech. */
   env?: string;
   ttlSeconds?: number;
@@ -47,6 +55,7 @@ export class TripletexClient {
   private refreshToken: string;
   private consumerToken: string;
   private employeeToken: string;
+  private kind: "jwt" | "employee";
   private ttlSeconds: number;
   private baseUrl: string;
   private session: SessionToken | null = null;
@@ -60,15 +69,21 @@ export class TripletexClient {
     //      token, and no application to Tripletex. This is the simple path.
     //   2. Commercial integration (many customers): consumer token from
     //      Tripletex + an employee token created by each end customer.
+    // An explicit kind means the caller knows which credential it holds; only
+    // consult the environment for the flow that kind actually uses.
     const refresh =
-      credentials.jwt ||
-      process.env.TRIPLETEX_JWT ||
-      process.env.TRIPLETEX_REFRESH_TOKEN ||
-      "";
+      credentials.kind === "employee"
+        ? ""
+        : credentials.jwt ||
+          process.env.TRIPLETEX_JWT ||
+          process.env.TRIPLETEX_REFRESH_TOKEN ||
+          "";
     const consumer =
       credentials.consumerToken || process.env.TRIPLETEX_CONSUMER_TOKEN || "";
     const employee =
-      credentials.employeeToken || process.env.TRIPLETEX_EMPLOYEE_TOKEN || "";
+      credentials.kind === "jwt"
+        ? ""
+        : credentials.employeeToken || process.env.TRIPLETEX_EMPLOYEE_TOKEN || "";
     if (!refresh && !employee) {
       throw new Error(
         "Missing Tripletex credentials. Set TRIPLETEX_JWT (internal integration: " +
@@ -76,6 +91,17 @@ export class TripletexClient {
           "TRIPLETEX_EMPLOYEE_TOKEN (commercial integration). Over HTTP transport " +
           "these can also be sent per request as X-Tripletex-Jwt / " +
           "X-Tripletex-Consumer-Token / X-Tripletex-Employee-Token."
+      );
+    }
+    this.kind = credentials.kind ?? (refresh ? "jwt" : "employee");
+    // Tripletex rejects :create without a consumer token (422, validation on the
+    // consumerToken field), so an employee token alone can never work. Fail here
+    // with the cause rather than on the first tool call with a 422 body.
+    if (this.kind === "employee" && !consumer) {
+      throw new Error(
+        "An employee token requires a consumer token. Set TRIPLETEX_CONSUMER_TOKEN " +
+          "(or send X-Tripletex-Consumer-Token) — Tripletex rejects " +
+          "/token/session/:create without it."
       );
     }
     this.refreshToken = refresh;
@@ -90,9 +116,10 @@ export class TripletexClient {
   }
 
   private async createSession(): Promise<void> {
-    this.session = this.refreshToken
-      ? await this.createSessionFromJwt()
-      : await this.createSessionFromTokenPair();
+    this.session =
+      this.kind === "jwt"
+        ? await this.createSessionFromJwt()
+        : await this.createSessionFromTokenPair();
   }
 
   /** Internal integration: exchange the JWT secret for a session token. */

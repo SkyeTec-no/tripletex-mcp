@@ -113,7 +113,7 @@ i `env`-blokken.
 
 Serveren håndterer alt automatisk. Ved første kall opprettes en session token:
 
-- **Med `TRIPLETEX_JWT`:** `POST /v2/token/session/:createFromRefreshToken` med `{ refreshToken, ttlSeconds }`. Levetiden er 12 timer som standard, og kan overstyres med `TRIPLETEX_SESSION_TTL_SECONDS`.
+- **Med `TRIPLETEX_JWT`:** `POST /v2/token/session/:createFromRefreshToken` med `{ refreshToken, ttlSeconds }`. Levetiden er 8 timer som standard (Tripletex' tak er 28800 s), og kan overstyres med `TRIPLETEX_SESSION_TTL_SECONDS`.
 - **Med consumer + employee token:** `PUT /v2/token/session/:create`. Disse utløper ved midnatt CET.
 
 Session token fornyes automatisk når den utløper, og ved 401 forsøkes kallet på nytt med fersk token. Alle API-kall bruker Basic Auth med brukernavn `0` og session token som passord.
@@ -128,9 +128,32 @@ Du trenger ikke tenke på dette — bare sett miljøvariablene.
 | `TRIPLETEX_CONSUMER_TOKEN` | Consumer token (kommersiell integrasjon) |
 | `TRIPLETEX_EMPLOYEE_TOKEN` | Employee token (kommersiell integrasjon) |
 | `TRIPLETEX_ENV` | `test` for `api-test.tripletex.tech`. Utelates i produksjon |
-| `TRIPLETEX_SESSION_TTL_SECONDS` | Levetid på session token i JWT-flyten. Standard `43200` (12 t) |
+| `TRIPLETEX_SESSION_TTL_SECONDS` | Levetid på session token i JWT-flyten. Standard `28800` (8 t, Tripletex' maks) |
 | `MCP_TRANSPORT` | `http` for Railway/remote (endepunkt `/mcp`). Standard `stdio` |
 | `PORT` | Port i HTTP-modus. Settes automatisk av Railway |
+
+#### SkyeTec-fork: OAuth, innlogging og skrivetilgang
+
+| Variabel | Hva |
+|---|---|
+| `OAUTH_ENC_KEY` | 32 tilfeldige bytes, base64. Slår på OAuth-fasaden og forsegler tokens (AES-256-GCM). **Uten denne nekter HTTP-transporten å starte** |
+| `PUBLIC_BASE_URL` | Utstederen (issuer) — der `/authorize`, `/token` og `/register` ligger. Påkrevd når OAuth er på |
+| `PUBLIC_RESOURCE_URL` | Settes kun når MCP-endepunktet ligger under en annen sti enn issueren (sti-ruteren på `mcp.skyetec.ai`). Utelatt → samme som `PUBLIC_BASE_URL` |
+| `OAUTH_ALLOWED_REDIRECTS` | Kommaseparerte redirect-URI-er som `/register` godtar. Loopback er alltid tillatt |
+| `TRIPLETEX_CONSUMER_TOKEN` | **Påkrevd for personlige nøkler.** Serverens egen consumer token. Den er hemmelig og skal aldri sendes til nettleseren — kun employee-tokenet kommer fra brukeren |
+| `TRIPLETEX_CONSUMER_NAME` | Applikasjonsnavnet brukeren må oppgi i Tripletex når nøkkelen opprettes. Vises på innloggingssiden |
+| `MCP_READ_ONLY` | `true` → kun leseverktøy registreres, og skills slås av |
+| `MCP_WRITE_TOOLS` | Kommaseparert liste over skriveverktøy som slippes gjennom i tillegg til leseflaten |
+| `MCP_ALLOW_UNAUTHENTICATED` | `true` → tillat HTTP uten OAuth. Da er `/mcp` helt åpent; kun for lokal utvikling |
+
+Brukeren logger inn ved å lime inn sin **personlige nøkkel** fra eget ansattkort → **API-tilganger**
+(en base64-verdi som begynner med `eyJ`). Serveren veksler den mot en Tripletex-sesjon sammen med sin
+egen consumer token, og forsegler den kryptert i tilgangsnøkkelen — den lagres aldri i klartekst.
+`tlxr_`-tokens fra **Selskap → API-tokens** virker fortsatt; serveren kjenner igjen formen og velger
+riktig endepunkt selv.
+
+Tilgangen er avgrenset av Tripletex: en nøkkel kan aldri ha flere rettigheter enn den ansatte den er
+opprettet på.
 
 ### Nøkler per kall (HTTP-transport)
 

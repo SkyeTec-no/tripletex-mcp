@@ -20,7 +20,13 @@ import {
   type OrderLineInput,
 } from "./tripletex-transform.js";
 import { registerSkills } from "./skills/registry.js";
-import { handleOAuth, send401, tripletexTokenFromBearer } from "./oauth.js";
+import {
+  handleOAuth,
+  oauthEnabled,
+  send401,
+  tripletexTokenFromBearer,
+  type BearerAuth,
+} from "./oauth.js";
 
 /**
  * The read-only surface (SkyeTec fork): with MCP_READ_ONLY=true only these
@@ -62,7 +68,11 @@ function readOnly(): boolean {
  * a restart loses the cache, but the tenant outbox's status short-circuit is
  * the first ring of dedupe — this is the belt to that braces).
  */
-const idemContext = new AsyncLocalStorage<{ key: string | undefined }>();
+const idemContext = new AsyncLocalStorage<{
+  key: string | undefined;
+  /** Per-caller cache namespace; undefined only when OAuth is off. */
+  scope: string | undefined;
+}>();
 const IDEM_TTL_MS = 48 * 60 * 60 * 1000;
 const idemCache = new Map<string, { at: number; result: unknown }>();
 
@@ -75,6 +85,16 @@ function isErrorShapedResult(result: unknown): boolean {
   } catch {
     return false;
   }
+}
+
+function idemStore(
+  req: IncomingMessage,
+  bearer: BearerAuth | null | "off"
+): { key: string | undefined; scope: string | undefined } {
+  return {
+    key: idempotencyKeyFromRequest(req),
+    scope: bearer && bearer !== "off" ? bearer.scope : undefined,
+  };
 }
 
 function idempotencyKeyFromRequest(req: IncomingMessage): string | undefined {
@@ -90,7 +110,10 @@ function withIdempotency(
   return async (...a: unknown[]) => {
     const key = idemContext.getStore()?.key;
     if (!key) return cb(...a);
-    const cacheKey = `${toolName}:${key}`;
+    // Namespaced by caller: the key is chosen by the client, so two users
+    // sending the same Idempotency-Key would otherwise collide and the second
+    // would be handed the first one's result.
+    const cacheKey = `${idemContext.getStore()?.scope ?? "-"}:${toolName}:${key}`;
     const now = Date.now();
     for (const [k, v] of idemCache) if (now - v.at > IDEM_TTL_MS) idemCache.delete(k);
     const hit = idemCache.get(cacheKey);
@@ -1068,6 +1091,27 @@ async function main() {
 
   if (transportMode === "http") {
     // --- Streamable HTTP transport (for Railway / remote hosting) ---
+
+    // Fail closed. Without OAUTH_ENC_KEY the Bearer gate reports "off" and /mcp
+    // falls back to the X-Tripletex-* headers or the environment credentials —
+    // i.e. the URL alone would serve the configured company's books, silently
+    // and with no error to notice. Refuse to start instead.
+    if (!oauthEnabled() && process.env.MCP_ALLOW_UNAUTHENTICATED !== "true") {
+      throw new Error(
+        "Refusing to serve /mcp unauthenticated over HTTP: OAUTH_ENC_KEY is not set. " +
+          "Set it (32 bytes, base64) together with PUBLIC_BASE_URL, or set " +
+          "MCP_ALLOW_UNAUTHENTICATED=true if this deployment really is meant to be open."
+      );
+    }
+    // Employee tokens (ansattkortet -> API-tilganger) cannot be redeemed without
+    // it, and the failure would otherwise surface as the user's key being
+    // rejected at /authorize.
+    if (oauthEnabled() && !process.env.TRIPLETEX_CONSUMER_TOKEN) {
+      console.error(
+        "WARNING: TRIPLETEX_CONSUMER_TOKEN is not set — only tlxr_ tokens will work at /authorize."
+      );
+    }
+
     const PORT = parseInt(process.env.PORT ?? "3000", 10);
 
     // Track active transports by session ID
@@ -1108,7 +1152,7 @@ async function main() {
           if (sessionId && transports.has(sessionId)) {
             // Existing session — forward to its transport
             const transport = transports.get(sessionId)!;
-            await idemContext.run({ key: idempotencyKeyFromRequest(req) }, () => transport.handleRequest(req, res));
+            await idemContext.run(idemStore(req, bearer), () => transport.handleRequest(req, res));
             return;
           }
 
@@ -1137,15 +1181,24 @@ async function main() {
 
           // Re-register all tools on the session server, bound to whatever
           // credentials this client sent (falling back to the environment).
-          const credentials =
+          const credentials: TripletexCredentials | undefined =
             bearer === "off"
               ? credentialsFromHeaders(req)
-              : { jwt: bearer, env: process.env.TRIPLETEX_ENV };
+              : bearer.kind === "employee"
+                ? {
+                    // The employee token is the user's; the consumer token is
+                    // the server's and never leaves it.
+                    kind: "employee",
+                    employeeToken: bearer.token,
+                    consumerToken: process.env.TRIPLETEX_CONSUMER_TOKEN,
+                    env: process.env.TRIPLETEX_ENV,
+                  }
+                : { kind: "jwt", jwt: bearer.token, env: process.env.TRIPLETEX_ENV };
           registerAllTools(toolSink(sessionServer), lazyClient(credentials));
           if (!readOnly()) registerSkills(sessionServer);
 
           await sessionServer.connect(transport);
-          await idemContext.run({ key: idempotencyKeyFromRequest(req) }, () => transport.handleRequest(req, res));
+          await idemContext.run(idemStore(req, bearer), () => transport.handleRequest(req, res));
           return;
         }
 
@@ -1154,7 +1207,7 @@ async function main() {
           const sessionId = req.headers["mcp-session-id"] as string | undefined;
           if (sessionId && transports.has(sessionId)) {
             const transport = transports.get(sessionId)!;
-            await idemContext.run({ key: idempotencyKeyFromRequest(req) }, () => transport.handleRequest(req, res));
+            await idemContext.run(idemStore(req, bearer), () => transport.handleRequest(req, res));
             return;
           }
           res.writeHead(400, { "Content-Type": "application/json" });
@@ -1167,7 +1220,7 @@ async function main() {
           const sessionId = req.headers["mcp-session-id"] as string | undefined;
           if (sessionId && transports.has(sessionId)) {
             const transport = transports.get(sessionId)!;
-            await idemContext.run({ key: idempotencyKeyFromRequest(req) }, () => transport.handleRequest(req, res));
+            await idemContext.run(idemStore(req, bearer), () => transport.handleRequest(req, res));
             transports.delete(sessionId);
             return;
           }
