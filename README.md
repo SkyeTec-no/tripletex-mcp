@@ -144,6 +144,7 @@ Du trenger ikke tenke på dette — bare sett miljøvariablene.
 | `TRIPLETEX_CONSUMER_NAME` | Applikasjonsnavnet brukeren må oppgi i Tripletex når nøkkelen opprettes. Vises på innloggingssiden |
 | `MCP_READ_ONLY` | `true` → kun leseverktøy registreres, og skills slås av |
 | `MCP_WRITE_TOOLS` | Kommaseparert liste over skriveverktøy som slippes gjennom i tillegg til leseflaten |
+| `TRIPLETEX_MCP_STATE_DSN` | Postgres-DSN for kvitteringstabellen (`write_receipts`): `Idempotency-Key` → første resultat, bundet til kaller og verktøy. Satt → varig dedupe som overlever omstart, og en utilgjengelig database **nekter** skrivet i stedet for å kjøre det ukvittert. Usatt → in-memory, varslet på stderr ved oppstart |
 | `MCP_ALLOW_UNAUTHENTICATED` | `true` → tillat HTTP uten OAuth. Da er `/mcp` helt åpent; kun for lokal utvikling |
 
 Brukeren logger inn ved å lime inn sin **personlige nøkkel** fra eget ansattkort → **API-tilganger**

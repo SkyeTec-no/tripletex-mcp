@@ -9,6 +9,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { z } from "zod";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { receiptStoreFromEnv, type ReceiptStore } from "./receipts.js";
 import {
   TripletexApiError,
   TripletexClient,
@@ -62,19 +63,22 @@ function readOnly(): boolean {
  * committer sends `Idempotency-Key: <write_id>` on every HTTP request of its
  * one-shot MCP client; a retried approval reuses the same key. The key rides
  * AsyncLocalStorage from the HTTP handler into the tool callback (the callback
- * closes over the session, not the request), and a keyed write returns the
- * cached FIRST result instead of running again — an invoice is money, and a
- * committer retry must never create it twice. In-memory only (min_replicas=1;
- * a restart loses the cache, but the tenant outbox's status short-circuit is
- * the first ring of dedupe — this is the belt to that braces).
+ * closes over the session, not the request). A keyed write is CLAIMED in the
+ * receipt store before it runs and its result recorded after, so a retry gets
+ * the first result back instead of running again — an invoice is money, and a
+ * committer retry must never create it twice. The store is durable (Postgres,
+ * TRIPLETEX_MCP_STATE_DSN) in the SkyeTec deployment; see receipts.ts for the
+ * semantics, and for why "in flight" and "conflict" refuse rather than run.
  */
 const idemContext = new AsyncLocalStorage<{
   key: string | undefined;
   /** Per-caller cache namespace; undefined only when OAuth is off. */
   scope: string | undefined;
 }>();
-const IDEM_TTL_MS = 48 * 60 * 60 * 1000;
-const idemCache = new Map<string, { at: number; result: unknown }>();
+let receipts: ReceiptStore | undefined;
+function receiptStore(): ReceiptStore {
+  return (receipts ??= receiptStoreFromEnv(allowedWriteTools().size > 0));
+}
 
 function isErrorShapedResult(result: unknown): boolean {
   const text = (result as { content?: Array<{ text?: string }> } | null)?.content?.[0]?.text;
@@ -103,6 +107,10 @@ function idempotencyKeyFromRequest(req: IncomingMessage): string | undefined {
   return value && value.trim() ? value.trim() : undefined;
 }
 
+function refuse(text: string) {
+  return { content: [{ type: "text" as const, text }], isError: true };
+}
+
 function withIdempotency(
   toolName: string,
   cb: (...a: unknown[]) => unknown
@@ -112,19 +120,53 @@ function withIdempotency(
     if (!key) return cb(...a);
     // Namespaced by caller: the key is chosen by the client, so two users
     // sending the same Idempotency-Key would otherwise collide and the second
-    // would be handed the first one's result.
-    const cacheKey = `${idemContext.getStore()?.scope ?? "-"}:${toolName}:${key}`;
-    const now = Date.now();
-    for (const [k, v] of idemCache) if (now - v.at > IDEM_TTL_MS) idemCache.delete(k);
-    const hit = idemCache.get(cacheKey);
-    if (hit) return hit.result;
-    const result = await cb(...a);
-    // Cache only success — a failed attempt must stay retryable. Upstream's run()
+    // would be handed the first one's result — the store refuses that instead.
+    const scope = idemContext.getStore()?.scope ?? "-";
+    const store = receiptStore();
+    let lookup;
+    try {
+      lookup = await store.claim(key, scope, toolName);
+    } catch (e) {
+      // Fail closed: no receipt store, no write. The committer sees an error
+      // result, the outbox row stays retryable, and nothing reached Tripletex.
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error(`receipts: claim failed for ${toolName}: ${msg}`);
+      return refuse(`Write refused: the idempotency store is unavailable (${msg}). Nothing was sent to Tripletex; retry later.`);
+    }
+    switch (lookup.kind) {
+      case "replay":
+        return lookup.result;
+      case "conflict":
+        return refuse(`Write refused: Idempotency-Key ${key} was already used by another caller or tool.`);
+      case "in_flight":
+        return refuse(
+          `Write refused: an earlier attempt with Idempotency-Key ${key} started at ${lookup.since.toISOString()} and never completed. Check Tripletex for the result before proposing this write again.`
+        );
+      case "miss":
+        break;
+    }
+    let result: unknown;
+    try {
+      result = await cb(...a);
+    } catch (e) {
+      await store.release(key).catch((re) => console.error(`receipts: release failed for ${key}: ${re}`));
+      throw e;
+    }
+    // Record only success — a failed attempt must stay retryable. Upstream's run()
     // returns Tripletex API errors as SUCCESS text ({"httpStatus": 4xx, ...}), so
     // error-shaped text must be recognised here or a failed invoice would be
     // "deduped" into permanent failure.
-    if (!(result as { isError?: boolean } | null)?.isError && !isErrorShapedResult(result)) {
-      idemCache.set(cacheKey, { at: now, result });
+    if ((result as { isError?: boolean } | null)?.isError || isErrorShapedResult(result)) {
+      await store.release(key).catch((re) => console.error(`receipts: release failed for ${key}: ${re}`));
+      return result;
+    }
+    try {
+      await store.complete(key, result);
+    } catch (e) {
+      // The write LANDED but the receipt did not. The row stays claimed with no
+      // result, so a retry is refused as in-flight instead of double-writing;
+      // the operator resolves it from Tripletex. Loud, because it needs a human.
+      console.error(`receipts: COMPLETE FAILED for ${toolName} key=${key} — write landed, receipt missing: ${e}`);
     }
     return result;
   };
@@ -1239,6 +1281,17 @@ async function main() {
       res.end(JSON.stringify({ error: "Not found" }));
     });
 
+    // Announce the receipt store once, and warm the schema so a wrong DSN shows
+    // up in the boot log rather than on the first invoice. A failure here does
+    // not exit: reads must keep serving, and claim() refuses writes on its own.
+    {
+      const store = receiptStore();
+      const warm = (store as { ensureSchema?: () => Promise<void> }).ensureSchema?.();
+      warm?.then(
+        () => console.error(`receipts: ${store.name} store ready`),
+        (e: unknown) => console.error(`receipts: ${store.name} store NOT ready — writes will be refused: ${e}`)
+      ) ?? console.error(`receipts: ${store.name} store`);
+    }
     httpServer.listen(PORT, () => {
       console.error(`Tripletex MCP server running on http://0.0.0.0:${PORT}/mcp`);
     });
