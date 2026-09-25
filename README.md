@@ -15,9 +15,10 @@ Kontakt meg på carl@cwv.no.
 | | `search_activities` | Søk etter aktiviteter |
 | | `search_time_entries` | Hent timeoppføringer for en periode |
 | | `create_time_entry` | Logg timer (krever `employeeId` + prosjekt/aktivitet) |
-| **Faktura** | `create_order` | Opprett ordre med Tripletex-felt (`orderLines`, `count`, priser) |
+| **Faktura** | `create_order` | Opprett ordre med Tripletex-felt (`orderLines`, `count`, priser; valgfri `departmentId`/`projectId`) |
 | | `invoice_order` | Fakturer eksisterende ordre |
-| | `create_invoice` | Ordre + faktura i ett steg |
+| | `create_invoice` | Ordre + faktura i ett steg (valgfri `departmentId`/`projectId`) |
+| | `create_credit_note` | Krediter en faktura i sin helhet (kreditnota) |
 | | `search_invoices` | Søk utgående fakturaer (påkrevd datointervall) |
 | | `get_invoice` | Hent én faktura (valgfri `fields`) |
 | | `search_supplier_invoices` | Søk leverandørfakturaer (påkrevd datointervall) |
@@ -29,11 +30,14 @@ Kontakt meg på carl@cwv.no.
 | | `create_supplier` | Opprett leverandør |
 | **Produkter** | `search_products` | Søk produkter |
 | | `create_product` | Opprett produkt |
-| **Regnskap** | `search_accounts` | Søk i kontoplan |
+| **Regnskap** | `search_accounts` | Søk i kontoplan (`number` eksakt, kommaseparert; `query` i navn og `numberFrom`/`numberTo` filtreres i serveren — Tripletex støtter dem ikke) |
 | | `search_vat_types` | Liste MVA-typer |
 | | `search_vouchers` | Søk bilag |
 | | `get_voucher` | Hent bilag |
-| | `create_voucher` | Opprett bilag (`amountGross` per linje) |
+| | `create_voucher` | Opprett bilag (`amountGross` per linje; valgfri avdeling, prosjekt, kunde, leverandør per linje; `voucherTypeId`, `vendorInvoiceNumber`) |
+| | `search_voucher_types` | Liste bilagstyper (f.eks. Leverandørfaktura) |
+| | `search_departments` | Søk avdelinger |
+| | `create_opening_balance` | Åpningsbalanse. **Kun når `TRIPLETEX_ENV=test`** — registreres aldri mot tripletex.no |
 | **Utility** | `whoami` | Info om innlogget bruker/selskap |
 | | `search_employees` | Søk ansatte (filtre: `lastName`, `employeeNumber`, `departmentId`) |
 

@@ -40,6 +40,8 @@ export type CreateOrderInput = {
   invoiceComment?: string;
   receiverEmail?: string;
   invoicesDueIn?: number;
+  departmentId?: number;
+  projectId?: number;
 };
 
 export function buildOrderBody(input: CreateOrderInput): Record<string, unknown> {
@@ -60,6 +62,8 @@ export function buildOrderBody(input: CreateOrderInput): Record<string, unknown>
   if (input.invoiceComment !== undefined) body.invoiceComment = input.invoiceComment;
   if (input.receiverEmail !== undefined) body.receiverEmail = input.receiverEmail;
   if (input.invoicesDueIn !== undefined) body.invoicesDueIn = input.invoicesDueIn;
+  if (input.departmentId !== undefined) body.department = { id: input.departmentId };
+  if (input.projectId !== undefined) body.project = { id: input.projectId };
   return body;
 }
 
@@ -70,6 +74,11 @@ export type VoucherPostingInput = {
   date: string;
   vatTypeId?: number;
   row?: number;
+  description?: string;
+  departmentId?: number;
+  projectId?: number;
+  customerId?: number;
+  supplierId?: number;
 };
 
 export function transformVoucherPosting(p: VoucherPostingInput): Record<string, unknown> {
@@ -78,8 +87,18 @@ export function transformVoucherPosting(p: VoucherPostingInput): Record<string, 
     amountGross: p.amountGross,
     date: p.date,
   };
-  if (p.amountGrossCurrency !== undefined) out.amountGrossCurrency = p.amountGrossCurrency;
+  // Tripletex 422s a posting whose amountGrossCurrency differs from amountGross in the
+  // company currency — including when it is absent — so default it to the NOK amount.
+  // Wrong for a foreign-currency account (the default would book the NOK figure as the
+  // foreign amount); callers posting there must pass amountGrossCurrency — the tool's
+  // schema says so. SkyeTec's tenants hold NOK accounts only (2026-09-25).
+  out.amountGrossCurrency = p.amountGrossCurrency ?? p.amountGross;
   if (p.vatTypeId !== undefined) out.vatType = { id: p.vatTypeId };
   if (p.row !== undefined) out.row = p.row;
+  if (p.description !== undefined) out.description = p.description;
+  if (p.departmentId !== undefined) out.department = { id: p.departmentId };
+  if (p.projectId !== undefined) out.project = { id: p.projectId };
+  if (p.customerId !== undefined) out.customer = { id: p.customerId };
+  if (p.supplierId !== undefined) out.supplier = { id: p.supplierId };
   return out;
 }

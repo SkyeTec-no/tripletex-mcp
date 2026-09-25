@@ -48,6 +48,8 @@ const READ_TOOLS = new Set([
   "get_voucher",
   "get_balance_sheet",
   "search_projects",
+  "search_departments",
+  "search_voucher_types",
   "search_activities",
   "search_time_entries",
   "search_employees",
@@ -369,6 +371,8 @@ server.tool(
     invoiceComment: z.string().optional(),
     receiverEmail: z.string().optional(),
     invoicesDueIn: z.number().optional(),
+    departmentId: z.number().optional().describe("Department (avdeling) → department.id"),
+    projectId: z.number().optional().describe("Project → project.id"),
   },
   async (args) =>
     run(() => client.post("/order", buildOrderBody(args)))
@@ -404,6 +408,8 @@ server.tool(
     ourReference: z.string().optional(),
     invoiceComment: z.string().optional(),
     sendToCustomer: z.boolean().optional(),
+    departmentId: z.number().optional().describe("Department (avdeling) → department.id"),
+    projectId: z.number().optional().describe("Project → project.id"),
   },
   async (args) =>
     run(async () => {
@@ -416,6 +422,8 @@ server.tool(
         currencyId: args.currencyId,
         ourReference: args.ourReference,
         invoiceComment: args.invoiceComment,
+        departmentId: args.departmentId,
+        projectId: args.projectId,
       });
       const orderResult = await client.post("/order", orderBody);
       const orderId = readValueId(orderResult);
@@ -432,6 +440,22 @@ server.tool(
           : {}),
       });
       return client.put(`/order/${orderId}/:invoice`, {}, params);
+    })
+);
+
+server.tool(
+  "create_credit_note",
+  "Credit an invoice in full: creates a credit note (kreditnota) that nullifies the given invoice. Omit sendToCustomer to use Tripletex default.",
+  {
+    invoiceId: z.number().describe("Invoice to credit → invoice.id"),
+    date: z.string().describe("Credit note date YYYY-MM-DD"),
+    comment: z.string().optional(),
+    sendToCustomer: z.boolean().optional(),
+  },
+  async ({ invoiceId, date, comment, sendToCustomer }) =>
+    run(() => {
+      const params = optionalParams({ date, comment, sendToCustomer });
+      return client.put(`/invoice/${invoiceId}/:createCreditNote`, {}, params);
     })
 );
 
@@ -751,9 +775,10 @@ server.tool(
 
 server.tool(
   "search_accounts",
-  "Search chart of accounts (query → name; optional numberFrom/numberTo).",
+  "Search chart of accounts. number: exact account number(s), comma-separated. query (substring of name) and numberFrom/numberTo (inclusive range) filter the chart.",
   {
     query: z.string().optional(),
+    number: z.string().optional().describe("Exact account number(s), comma-separated, e.g. \"1920,2400\""),
     numberFrom: z.string().optional(),
     fields: z.string().optional().describe("Tripletex `fields` expansion, e.g. \"id,name,customer(id,name)\" or \"*\""),
     numberTo: z.string().optional(),
@@ -761,16 +786,46 @@ server.tool(
     count: z.number().optional(),
   },
   async (args) =>
-    run(() => {
-      const params = optionalParams({
-        name: args.query,
-        numberFrom: args.numberFrom,
-        fields: args.fields,
-        numberTo: args.numberTo,
-        from: args.from,
-        count: args.count ?? 50,
-      });
-      return client.get("/ledger/account", params);
+    run(async () => {
+      // /ledger/account has no name or number-range parameter: Tripletex silently
+      // ignores unknown query params, so passing them through returned the first
+      // page of the chart whatever was asked. `number` is native; the name and
+      // range filters run here over the whole chart (a few hundred rows at most).
+      const clientSide =
+        args.query !== undefined || args.numberFrom !== undefined || args.numberTo !== undefined;
+      if (!clientSide) {
+        return client.get(
+          "/ledger/account",
+          optionalParams({ number: args.number, fields: args.fields, from: args.from, count: args.count ?? 50 })
+        );
+      }
+      const fields = args.fields && args.fields !== "*" && !/\bnumber\b/.test(args.fields)
+        ? `${args.fields},number,name`
+        : args.fields;
+      // Page through the whole chart: one call's count is capped server-side.
+      type Account = { number?: number; name?: string };
+      const chart: Account[] = [];
+      for (let from = 0; ; from += 1000) {
+        const page = (await client.get(
+          "/ledger/account",
+          optionalParams({ number: args.number, fields, from, count: 1000 })
+        )) as { values?: Account[] };
+        const values = page.values ?? [];
+        chart.push(...values);
+        if (values.length < 1000) break;
+      }
+      const all = { values: chart };
+      const q = args.query?.toLowerCase();
+      const lo = args.numberFrom !== undefined ? Number(args.numberFrom) : -Infinity;
+      const hi = args.numberTo !== undefined ? Number(args.numberTo) : Infinity;
+      const hits = (all.values ?? []).filter(
+        (a) =>
+          (q === undefined || (a.name ?? "").toLowerCase().includes(q)) &&
+          (a.number === undefined || (a.number >= lo && a.number <= hi))
+      );
+      const start = args.from ?? 0;
+      const values = hits.slice(start, start + (args.count ?? 50));
+      return { fullResultSize: hits.length, from: start, count: values.length, values };
     })
 );
 
@@ -793,22 +848,34 @@ server.tool(
   {
     date: z.string().describe("Voucher date YYYY-MM-DD"),
     description: z.string().optional(),
+    voucherTypeId: z.number().optional().describe("Voucher type → voucherType.id (see search_voucher_types)"),
+    vendorInvoiceNumber: z.string().optional().describe("Supplier's invoice number, for a supplier-invoice voucher"),
     postings: z.array(
       z.object({
         accountId: z.number(),
         amountGross: z.number(),
-        amountGrossCurrency: z.number().optional(),
+        amountGrossCurrency: z
+          .number()
+          .optional()
+          .describe("Amount in the ACCOUNT's currency. Defaults to amountGross, which is only right for company-currency (NOK) accounts — pass it explicitly when posting to a foreign-currency account."),
         date: z.string().describe("Posting date YYYY-MM-DD"),
         vatTypeId: z.number().optional(),
         row: z.number().optional(),
+        description: z.string().optional(),
+        departmentId: z.number().optional().describe("Department (avdeling) → department.id"),
+        projectId: z.number().optional().describe("Project → project.id"),
+        customerId: z.number().optional().describe("Customer → customer.id (receivable postings)"),
+        supplierId: z.number().optional().describe("Supplier → supplier.id (payable postings)"),
       })
     ),
   },
-  async ({ date, description, postings }) =>
+  async ({ date, description, voucherTypeId, vendorInvoiceNumber, postings }) =>
     run(() =>
       client.post("/ledger/voucher", {
         date,
         ...(description !== undefined ? { description } : {}),
+        ...(voucherTypeId !== undefined ? { voucherType: { id: voucherTypeId } } : {}),
+        ...(vendorInvoiceNumber !== undefined ? { vendorInvoiceNumber } : {}),
         postings: postings.map(transformVoucherPosting),
       })
     )
@@ -1106,6 +1173,106 @@ server.tool(
       return client.post("/department", body);
     })
 );
+
+server.tool(
+  "search_departments",
+  "Search departments (avdelinger; query → name).",
+  {
+    query: z.string().optional(),
+    departmentNumber: z.string().optional(),
+    isInactive: z.boolean().optional(),
+    fields: z.string().optional(),
+    from: z.number().optional(),
+    count: z.number().optional(),
+  },
+  async (args) =>
+    run(() =>
+      client.get(
+        "/department",
+        optionalParams({
+          name: args.query,
+          departmentNumber: args.departmentNumber,
+          isInactive: args.isInactive,
+          fields: args.fields,
+          from: args.from,
+          count: args.count ?? 25,
+        })
+      )
+    )
+);
+
+server.tool(
+  "search_voucher_types",
+  "Search voucher types (bilagstyper; query → name), e.g. Leverandørfaktura.",
+  {
+    query: z.string().optional(),
+    fields: z.string().optional(),
+    count: z.number().optional(),
+  },
+  async (args) =>
+    run(() =>
+      client.get(
+        "/ledger/voucherType",
+        optionalParams({ name: args.query, fields: args.fields, count: args.count ?? 50 })
+      )
+    )
+);
+
+// Test-environment only (SkyeTec fork): an opening balance zeroes every movement
+// before its date — a one-off company-setup act with no place in a product surface.
+// It exists so the eval seeder can build a test company. Two locks, because they
+// guard different inputs: registration keys on the process env (a prod deployment
+// never lists the tool at all), and the handler refuses unless the client it is
+// about to call resolves to the test API — on the header-auth HTTP path a caller
+// picks the target per request via x-tripletex-env, independent of the process env.
+if (process.env.TRIPLETEX_ENV === "test") {
+  const openingBalanceDims = {
+    departmentId: z.number().optional(),
+    projectId: z.number().optional(),
+  };
+  server.tool(
+    "create_opening_balance",
+    "TEST ENVIRONMENT ONLY. Set the opening balance (åpningsbalanse) on voucherDate (first day of a month). Movements before that date are zeroed in a correction voucher; an unbalanced set posts the difference to a help account.",
+    {
+      voucherDate: z.string().describe("YYYY-MM-DD, first day of a month"),
+      balancePostings: z
+        .array(z.object({ accountId: z.number(), amount: z.number(), ...openingBalanceDims }))
+        .optional(),
+      customerPostings: z
+        .array(z.object({ customerId: z.number(), amount: z.number(), description: z.string().optional() }))
+        .optional(),
+      supplierPostings: z
+        .array(z.object({ supplierId: z.number(), amount: z.number(), description: z.string().optional() }))
+        .optional(),
+    },
+    async ({ voucherDate, balancePostings, customerPostings, supplierPostings }) => {
+      if (!client.targetsTestEnvironment()) {
+        throw new Error("create_opening_balance is test-environment only; this session targets tripletex.no");
+      }
+      return run(() =>
+        client.post("/ledger/voucher/openingBalance", {
+          voucherDate,
+          balancePostings: (balancePostings ?? []).map((p) => ({
+            account: { id: p.accountId },
+            amount: p.amount,
+            ...(p.departmentId !== undefined ? { department: { id: p.departmentId } } : {}),
+            ...(p.projectId !== undefined ? { project: { id: p.projectId } } : {}),
+          })),
+          customerPostings: (customerPostings ?? []).map((p) => ({
+            customer: { id: p.customerId },
+            amount: p.amount,
+            ...(p.description !== undefined ? { description: p.description } : {}),
+          })),
+          supplierPostings: (supplierPostings ?? []).map((p) => ({
+            supplier: { id: p.supplierId },
+            amount: p.amount,
+            ...(p.description !== undefined ? { description: p.description } : {}),
+          })),
+        })
+      );
+    }
+  );
+}
 
 // ===========================================================================
 // UTILITY

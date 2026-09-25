@@ -254,6 +254,13 @@ export class TripletexClient {
     }
   }
 
+  /** True when this client's calls go to api-test.tripletex.tech. Resolved per client
+   *  from credentials.env || TRIPLETEX_ENV, so on the header-auth HTTP path a caller can
+   *  steer it — test-only tools must check THIS, not process.env. */
+  targetsTestEnvironment(): boolean {
+    return this.baseUrl === TEST_BASE;
+  }
+
   async get(path: string, params?: Record<string, string>) {
     return this.request("GET", path, params);
   }
